@@ -6,14 +6,14 @@ import plotly.graph_objects as go
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Conservative Pro Crypto Scanner", page_icon="₿",
-                   layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Conservative Pro Crypto Scanner V3",
+                   page_icon="₿", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
 .block-container{max-width:1500px;padding:.8rem .8rem 2rem}
 .signal-box{border:1px solid rgba(148,163,184,.18);border-radius:16px;padding:15px;
-background:linear-gradient(145deg,#111827,#0f172a);min-height:205px;margin-bottom:12px}
+background:linear-gradient(145deg,#111827,#0f172a);min-height:210px;margin-bottom:12px}
 .buy{border-left:6px solid #22c55e}.sell{border-left:6px solid #ef4444}
 .wait{border-left:6px solid #f59e0b}.strongbuy{border-left:6px solid #10b981}
 .strongsell{border-left:6px solid #dc2626}
@@ -21,40 +21,43 @@ background:linear-gradient(145deg,#111827,#0f172a);min-height:205px;margin-botto
 .muted{color:#94a3b8;font-size:.80rem}.price{font-size:1.22rem;font-weight:700}
 .tag{display:inline-block;padding:3px 8px;margin:2px;border-radius:99px;background:#1e293b;color:#cbd5e1;font-size:.70rem}
 div[data-testid="stMetric"]{background:#0f172a;border:1px solid rgba(148,163,184,.14);padding:10px;border-radius:14px}
-@media(max-width:700px){.block-container{padding:.5rem}.signal-box{min-height:185px;padding:12px}}
+@media(max-width:700px){.block-container{padding:.5rem}.signal-box{min-height:190px;padding:12px}}
 </style>
 """, unsafe_allow_html=True)
 
 COINS={"Bitcoin":"BTC-USD","Ethereum":"ETH-USD","BNB":"BNB-USD",
        "Solana":"SOL-USD","XRP":"XRP-USD"}
 
-st.title("₿ Conservative Pro Crypto Scanner")
-st.caption("EMA 200 • RSI(10) • RSI SMA(14) • Long + Short • 2% SL • 4% TP")
+st.title("₿ Conservative Pro Crypto Scanner V3")
+st.caption("EMA 200 • RSI 10/14 • Volume • ATR • Trend/Chop Filter • 2% SL • 4% TP")
 
 with st.sidebar:
     st.header("⚙️ Scanner Settings")
-    interval_choice=st.selectbox("Candle timeframe",["1h","2h","4h","1d"],index=2)
-    refresh_seconds=st.slider("Auto refresh (seconds)",15,300,30,15)
-    auto_refresh=st.toggle("🔄 Auto Refresh",True)
+    interval=st.selectbox("Candle timeframe",["1h","2h","4h","1d"],index=2)
+    refresh=st.slider("Auto refresh (seconds)",15,300,30,15)
+    auto=st.toggle("🔄 Auto Refresh",True)
     st.divider()
-    st.subheader("Strategy")
-    ema_len=st.number_input("EMA",10,500,200)
-    rsi_len=st.number_input("RSI",2,100,10)
-    rsi_sma_len=st.number_input("RSI SMA",2,100,14)
-    st.divider()
-    st.subheader("Risk Management")
+    st.subheader("Core Strategy")
+    ema_len=st.number_input("EMA",100,400,200)
+    rsi_len=st.number_input("RSI",5,30,10)
+    rsi_sma_len=st.number_input("RSI SMA",5,30,14)
+    st.subheader("Confirmation")
+    volume_len=st.number_input("Volume SMA",5,50,20)
+    atr_len=st.number_input("ATR",5,50,14)
+    min_atr_pct=st.number_input("Minimum ATR %",0.05,10.0,0.20,0.05)
+    st.subheader("Risk")
     sl_pct=st.number_input("Stop Loss %",0.1,20.0,2.0,0.1)
     tp_pct=st.number_input("Take Profit %",0.1,50.0,4.0,0.1)
 
-if auto_refresh:
-    st_autorefresh(interval=refresh_seconds*1000,key="crypto_auto_refresh")
+if auto:
+    st_autorefresh(interval=refresh*1000,key="v3_refresh")
 
 @st.cache_data(ttl=20,show_spinner=False)
-def download_data(ticker,interval,period):
+def fetch(ticker, interval, period):
     native="1h" if interval in ("1h","2h","4h") else "1d"
     raw=yf.download(ticker,period=period,interval=native,progress=False,
                     auto_adjust=False,threads=False)
-    if raw is None or raw.empty: return None
+    if raw is None or raw.empty:return None
     if isinstance(raw.columns,pd.MultiIndex):
         raw.columns=raw.columns.get_level_values(0)
     raw=raw.reset_index()
@@ -64,345 +67,207 @@ def download_data(ticker,interval,period):
     raw=raw[keep].copy()
     raw["Date"]=pd.to_datetime(raw["Date"],errors="coerce",utc=True)
     for c in ["Open","High","Low","Close","Volume"]:
-        if c in raw.columns: raw[c]=pd.to_numeric(raw[c],errors="coerce")
+        raw[c]=pd.to_numeric(raw[c],errors="coerce")
     raw=raw.dropna(subset=["Date","Open","High","Low","Close"]).sort_values("Date").set_index("Date")
     if interval in ("2h","4h"):
-        raw=raw.resample(interval).agg({
-            "Open":"first","High":"max","Low":"min","Close":"last",
-            "Volume":"sum" if "Volume" in raw.columns else "last"
-        }).dropna(subset=["Open","High","Low","Close"])
+        raw=raw.resample(interval).agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
     return raw
 
-def rsi_wilder(close,length):
-    delta=close.diff()
-    gain=delta.clip(lower=0); loss=-delta.clip(upper=0)
-    ag=gain.ewm(alpha=1/length,adjust=False,min_periods=length).mean()
-    al=loss.ewm(alpha=1/length,adjust=False,min_periods=length).mean()
-    rs=ag/al.replace(0,np.nan)
-    return 100-(100/(1+rs))
+def rsi(close,n):
+    d=close.diff(); gain=d.clip(lower=0); loss=-d.clip(upper=0)
+    ag=gain.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+    al=loss.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+    return 100-100/(1+ag/al.replace(0,np.nan))
 
 def indicators(df):
     d=df.copy()
-    d["EMA"]=d["Close"].ewm(span=ema_len,adjust=False).mean()
-    d["RSI"]=rsi_wilder(d["Close"],rsi_len)
-    d["RSI_SMA"]=d["RSI"].rolling(rsi_sma_len).mean()
+    d["EMA200"]=d.Close.ewm(span=ema_len,adjust=False).mean()
+    d["RSI"]=rsi(d.Close,rsi_len)
+    d["RSI_SMA"]=d.RSI.rolling(rsi_sma_len).mean()
+    d["VOL_SMA"]=d.Volume.rolling(volume_len).mean()
+    prev=d.Close.shift(1)
+    tr=pd.concat([(d.High-d.Low),(d.High-prev).abs(),(d.Low-prev).abs()],axis=1).max(axis=1)
+    d["ATR"]=tr.rolling(atr_len).mean()
+    d["ATR_PCT"]=d.ATR/d.Close*100
+    d["EMA_SLOPE"]=d.EMA200-d.EMA200.shift(5)
     d["BullCross"]=(d.RSI>d.RSI_SMA)&(d.RSI.shift(1)<=d.RSI_SMA.shift(1))
     d["BearCross"]=(d.RSI<d.RSI_SMA)&(d.RSI.shift(1)>=d.RSI_SMA.shift(1))
-    d["LONG_SIGNAL"]=d.BullCross&(d.Close>d.EMA)
-    d["SHORT_SIGNAL"]=d.BearCross&(d.Close<d.EMA)
+    d["VOL_OK"]=d.Volume>=d.VOL_SMA*0.90
+    d["VOL_STRONG"]=d.Volume>=d.VOL_SMA*1.20
+    # Stronger entries: trend + momentum + candle + volatility + volume.
+    d["LONG_SIGNAL"]=(
+        d.BullCross & (d.Close>d.EMA200) & (d.EMA_SLOPE>0) &
+        (d.RSI>=52) & (d.RSI<=68) & d.VOL_OK & (d.ATR_PCT>=min_atr_pct) &
+        (d.Close>d.Open)
+    )
+    d["SHORT_SIGNAL"]=(
+        d.BearCross & (d.Close<d.EMA200) & (d.EMA_SLOPE<0) &
+        (d.RSI<=48) & (d.RSI>=32) & d.VOL_OK & (d.ATR_PCT>=min_atr_pct) &
+        (d.Close<d.Open)
+    )
     return d.dropna()
 
-def signal_info(d):
+def classify(d):
     r=d.iloc[-1]
+    long_score=sum([r.Close>r.EMA200,r.EMA_SLOPE>0,r.RSI>r.RSI_SMA,
+                    52<=r.RSI<=68,r.Volume>=r.VOL_SMA*.90,r.ATR_PCT>=min_atr_pct,r.Close>r.Open])
+    short_score=sum([r.Close<r.EMA200,r.EMA_SLOPE<0,r.RSI<r.RSI_SMA,
+                     32<=r.RSI<=48,r.Volume>=r.VOL_SMA*.90,r.ATR_PCT>=min_atr_pct,r.Close<r.Open])
     fresh="BUY" if bool(r.LONG_SIGNAL) else "SELL" if bool(r.SHORT_SIGNAL) else None
-    trend_up=bool(r.Close>r.EMA); momentum_up=bool(r.RSI>r.RSI_SMA)
-    gap=abs(float(r.Close-r.EMA))/float(r.EMA)*100
-    if fresh=="BUY" and r.RSI>=55 and gap>=.25: signal="STRONG BUY"
-    elif fresh=="SELL" and r.RSI<=45 and gap>=.25: signal="STRONG SELL"
-    elif fresh: signal=fresh
-    elif trend_up and momentum_up: signal="BUY"
-    elif not trend_up and not momentum_up: signal="SELL"
+    if fresh=="BUY" and long_score>=6:
+        signal="STRONG BUY"
+    elif fresh=="SELL" and short_score>=6:
+        signal="STRONG SELL"
+    elif fresh=="BUY": signal="BUY"
+    elif fresh=="SELL": signal="SELL"
+    elif long_score>=5 and r.Close>r.EMA200 and r.RSI>r.RSI_SMA: signal="BUY"
+    elif short_score>=5 and r.Close<r.EMA200 and r.RSI<r.RSI_SMA: signal="SELL"
     else: signal="WAIT"
     entry=float(r.Close)
     if "BUY" in signal: sl=entry*(1-sl_pct/100); tp=entry*(1+tp_pct/100)
     elif "SELL" in signal: sl=entry*(1+sl_pct/100); tp=entry*(1-tp_pct/100)
     else: sl=tp=None
-    score=int(round(((
-        (1 if trend_up else -1)+(1 if momentum_up else -1)+
-        (1 if r.RSI>=55 else -1 if r.RSI<=45 else 0)+
-        (1 if gap>=.25 and trend_up else -1 if gap>=.25 else 0)
-    )+4)/8*100))
+    strength=max(long_score,short_score)/7*100
     cls="strongbuy" if signal=="STRONG BUY" else "buy" if signal=="BUY" else "strongsell" if signal=="STRONG SELL" else "sell" if signal=="SELL" else "wait"
-    return dict(signal=signal,cls=cls,price=entry,ema=float(r.EMA),rsi=float(r.RSI),
-                rsi_sma=float(r.RSI_SMA),trend="BULLISH" if trend_up else "BEARISH",
-                momentum="BULLISH" if momentum_up else "BEARISH",entry=entry if signal!="WAIT" else None,
-                sl=sl,tp=tp,score=score,time=r.name)
+    return {"signal":signal,"cls":cls,"price":entry,"ema":float(r.EMA200),"rsi":float(r.RSI),
+            "rsi_sma":float(r.RSI_SMA),"atr":float(r.ATR_PCT),"strength":strength,
+            "volume_ok":bool(r.VOL_OK),"time":r.name}
 
-# Backtest requested by the user: fixed starting capital ₹10,000, last 30 days.
-def run_backtest(df, initial_capital=10000.0):
-    d=indicators(df).copy()
-    capital=float(initial_capital)
-    position=None
-    entry_price=0.0
-    trades=[]
+def backtest(df, initial=10000.0):
+    d=indicators(df)
+    capital=initial; pos=None; entry=0.0; trades=[]
     equity=[]
-
-    for ts,row in d.iterrows():
-        high=float(row.High); low=float(row.Low); close=float(row.Close)
-
-        # Entry only on a confirmed strategy signal.
-        if position is None:
-            if bool(row.LONG_SIGNAL):
-                position="LONG"; entry_price=close
-            elif bool(row.SHORT_SIGNAL):
-                position="SHORT"; entry_price=close
+    for ts,r in d.iterrows():
+        hi=float(r.High); lo=float(r.Low); close=float(r.Close)
+        if pos is None:
+            if bool(r.LONG_SIGNAL): pos="LONG"; entry=close
+            elif bool(r.SHORT_SIGNAL): pos="SHORT"; entry=close
+        elif pos=="LONG":
+            sl=entry*(1-sl_pct/100); tp=entry*(1+tp_pct/100)
+            if lo<=sl:
+                exitp=sl; reason="SL"
+            elif hi>=tp:
+                exitp=tp; reason="TP"
+            elif bool(r.SHORT_SIGNAL):
+                exitp=close; reason="SIGNAL"
+            else: exitp=None
+            if exitp is not None:
+                pnl=capital*(exitp-entry)/entry; capital+=pnl
+                trades.append([ts,pos,entry,exitp,pnl,reason]); pos=None
         else:
-            if position=="LONG":
-                sl=entry_price*(1-sl_pct/100); tp=entry_price*(1+tp_pct/100)
-                hit=None; exit_price=None
-                # Conservative assumption if both are touched in one candle: SL first.
-                if low<=sl: hit="SL"; exit_price=sl
-                elif high>=tp: hit="TP"; exit_price=tp
-                elif bool(row.SHORT_SIGNAL):
-                    hit="SIGNAL"; exit_price=close
-                if hit:
-                    pnl_pct=(exit_price-entry_price)/entry_price*100
-                    pnl=capital*(pnl_pct/100)
-                    capital+=pnl
-                    trades.append([ts,"LONG",entry_price,exit_price,pnl,hit])
-                    position=None
-            else:
-                sl=entry_price*(1+sl_pct/100); tp=entry_price*(1-tp_pct/100)
-                hit=None; exit_price=None
-                if high>=sl: hit="SL"; exit_price=sl
-                elif low<=tp: hit="TP"; exit_price=tp
-                elif bool(row.LONG_SIGNAL):
-                    hit="SIGNAL"; exit_price=close
-                if hit:
-                    pnl_pct=(entry_price-exit_price)/entry_price*100
-                    pnl=capital*(pnl_pct/100)
-                    capital+=pnl
-                    trades.append([ts,"SHORT",entry_price,exit_price,pnl,hit])
-                    position=None
+            sl=entry*(1+sl_pct/100); tp=entry*(1-tp_pct/100)
+            if hi>=sl:
+                exitp=sl; reason="SL"
+            elif lo<=tp:
+                exitp=tp; reason="TP"
+            elif bool(r.LONG_SIGNAL):
+                exitp=close; reason="SIGNAL"
+            else: exitp=None
+            if exitp is not None:
+                pnl=capital*(entry-exitp)/entry; capital+=pnl
+                trades.append([ts,pos,entry,exitp,pnl,reason]); pos=None
+        mark=capital if pos is None else capital*((close-entry)/entry+1 if pos=="LONG" else (entry-close)/entry+1)
+        equity.append((ts,mark))
+    if pos and len(d):
+        close=float(d.iloc[-1].Close); pnl=capital*((close-entry)/entry if pos=="LONG" else (entry-close)/entry)
+        capital+=pnl; trades.append([d.index[-1],pos,entry,close,pnl,"END"])
+    t=pd.DataFrame(trades,columns=["Time","Side","Entry","Exit","PnL","Reason"])
+    wins=int((t.PnL>0).sum()) if not t.empty else 0
+    losses=int((t.PnL<=0).sum()) if not t.empty else 0
+    wr=wins/len(t)*100 if len(t) else 0
+    eq=pd.DataFrame(equity,columns=["Time","Equity"]).set_index("Time") if equity else pd.DataFrame()
+    dd=((eq.Equity-eq.Equity.cummax())/eq.Equity.cummax()*100).min() if not eq.empty else 0
+    return capital,capital-initial,len(t),wins,losses,wr,float(dd),t
 
-        # Mark-to-market equity for drawdown calculation.
-        if position=="LONG":
-            eq=capital*(1+(close-entry_price)/entry_price)
-        elif position=="SHORT":
-            eq=capital*(1+(entry_price-close)/entry_price)
-        else:
-            eq=capital
-        equity.append((ts,eq))
-
-    # Close any open position at the last available close for reporting.
-    if position is not None and len(d):
-        last_ts=d.index[-1]; last_close=float(d.iloc[-1].Close)
-        if position=="LONG":
-            pnl=capital*((last_close-entry_price)/entry_price)
-        else:
-            pnl=capital*((entry_price-last_close)/entry_price)
-        capital+=pnl
-        trades.append([last_ts,position,entry_price,last_close,pnl,"END"])
-
-    tdf=pd.DataFrame(trades,columns=["Time","Side","Entry","Exit","PnL","Exit Reason"])
-    if tdf.empty:
-        wins=losses=0; win_rate=0.0
-    else:
-        wins=int((tdf.PnL>0).sum()); losses=int((tdf.PnL<=0).sum())
-        win_rate=wins/len(tdf)*100
-
-    eqdf=pd.DataFrame(equity,columns=["Time","Equity"]).set_index("Time") if equity else pd.DataFrame()
-    if not eqdf.empty:
-        peak=eqdf.Equity.cummax()
-        dd=(eqdf.Equity-peak)/peak*100
-        max_dd=float(dd.min())
-    else:
-        max_dd=0.0
-
-    return {
-        "final":capital,"profit":capital-initial_capital,"trades":len(tdf),
-        "wins":wins,"losses":losses,"win_rate":win_rate,
-        "max_dd":max_dd,"trades_df":tdf,"equity_df":eqdf
-    }
-
-# Live scanner data
 results={}; errors={}
 for name,ticker in COINS.items():
     try:
-        raw=download_data(ticker,interval_choice,"60d" if interval_choice!="1d" else "2y")
-        if raw is None or len(raw)<max(ema_len,rsi_len+rsi_sma_len)+5:
-            errors[name]="Not enough market data"; continue
+        raw=fetch(ticker,interval,"90d" if interval!="1d" else "2y")
+        if raw is None: continue
         d=indicators(raw)
-        if len(d)<2: errors[name]="Not enough indicator data"; continue
-        results[name]={"data":d,"info":signal_info(d)}
-    except Exception as e:
-        errors[name]=str(e)[:100]
+        if len(d): results[name]={"data":d,"info":classify(d)}
+    except Exception as e: errors[name]=str(e)[:100]
 
 st.subheader("📡 Market Overview")
-orders=["STRONG BUY","BUY","WAIT","SELL","STRONG SELL"]
-counts={k:sum(v["info"]["signal"]==k for v in results.values()) for k in orders}
-cols=st.columns(5)
-for c,k in zip(cols,orders): c.metric(k,counts[k])
-bull=sum(v["info"]["trend"]=="BULLISH" for v in results.values())
-bear=sum(v["info"]["trend"]=="BEARISH" for v in results.values())
-bias="BULLISH" if bull>bear else "BEARISH" if bear>bull else "NEUTRAL"
-a,b,c=st.columns(3); a.metric("Market Bias",bias); b.metric("Bullish Coins",f"{bull}/{len(results)}"); c.metric("Bearish Coins",f"{bear}/{len(results)}")
-
-if errors: st.warning(" • ".join(f"{k}: {v}" for k,v in errors.items()))
-
-st.subheader("🔥 Signal Priority")
-rank={"STRONG BUY":6,"BUY":5,"SELL":-5,"STRONG SELL":-6,"WAIT":0}
-rows=[]
-for name,v in results.items():
-    x=v["info"]
-    rows.append({"Coin":name,"Signal":x["signal"],"Strength":f"{x['score']}%",
-                 "Price":x["price"],"Trend":x["trend"],"RSI":round(x["rsi"],2)})
-rows.sort(key=lambda r:rank.get(r["Signal"],0),reverse=True)
-st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+order=["STRONG BUY","BUY","WAIT","SELL","STRONG SELL"]
+cnt={k:sum(v["info"]["signal"]==k for v in results.values()) for k in order}
+cs=st.columns(5)
+for c,k in zip(cs,order): c.metric(k,cnt[k])
 
 st.subheader("🎯 Live Coin Scanner")
 names=list(COINS)
 for start in range(0,len(names),2):
-    cs=st.columns(2)
+    cols=st.columns(2)
     for j,name in enumerate(names[start:start+2]):
-        with cs[j]:
-            if name not in results: st.error(f"{name}: unavailable"); continue
+        with cols[j]:
+            if name not in results:
+                st.error(f"{name}: unavailable"); continue
             x=results[name]["info"]
             icon="🟢" if "BUY" in x["signal"] else "🔴" if "SELL" in x["signal"] else "🟡"
-            en="—" if x["entry"] is None else f"{x['entry']:,.6f}"
-            sl="—" if x["sl"] is None else f"{x['sl']:,.6f}"
-            tp="—" if x["tp"] is None else f"{x['tp']:,.6f}"
-            st.markdown(f"""
-<div class="signal-box {x['cls']}">
-<div class="coin">{icon} {name} <span class="muted">({COINS[name]})</span></div>
-<div class="signal">{x['signal']}</div>
+            en=f"{x['price']:,.6f}" if x["signal"]!="WAIT" else "—"
+            sl=f"{x['price']*(1-sl_pct/100):,.6f}" if "BUY" in x["signal"] else f"{x['price']*(1+sl_pct/100):,.6f}" if "SELL" in x["signal"] else "—"
+            tp=f"{x['price']*(1+tp_pct/100):,.6f}" if "BUY" in x["signal"] else f"{x['price']*(1-tp_pct/100):,.6f}" if "SELL" in x["signal"] else "—"
+            st.markdown(f"""<div class="signal-box {x['cls']}">
+<div class="coin">{icon} {name}</div><div class="signal">{x['signal']}</div>
 <div class="price">${x['price']:,.6f}</div>
-<span class="tag">Strength {x['score']}%</span><span class="tag">Trend {x['trend']}</span>
-<span class="tag">RSI {x['rsi']:.2f}</span><span class="tag">EMA {x['ema']:,.6f}</span>
+<span class="tag">Strength {x['strength']:.0f}%</span>
+<span class="tag">RSI {x['rsi']:.2f}</span>
+<span class="tag">ATR {x['atr']:.2f}%</span>
+<span class="tag">Volume {'OK' if x['volume_ok'] else 'LOW'}</span>
 <div style="margin-top:10px"><b>Entry:</b> {en} &nbsp; <b>SL:</b> {sl} &nbsp; <b>TP:</b> {tp}</div>
 </div>""",unsafe_allow_html=True)
 
-# ONLY requested new feature: 30-day backtest with ₹10,000 starting capital.
 st.divider()
-st.subheader("🧪 30-Day Backtest")
-st.caption("Starting capital: ₹10,000 • Uses the same BUY/SELL crossover rules • 2% SL • 4% TP")
+st.subheader("🧪 V3 Backtest")
+st.caption("30 days • ₹10,000 starting capital • same V3 filters • 2% SL • 4% TP")
 
-if st.button("▶️ Run Backtest",use_container_width=True):
-    all_trades=[]
-    total_initial=10000.0
-    per_coin=[]
-    with st.spinner("Running 30-day backtest for BTC, ETH, BNB, SOL and XRP..."):
+if st.button("▶️ Run 30-Day V3 Backtest",use_container_width=True):
+    rows=[]; all_trades=[]
+    with st.spinner("Backtesting BTC, ETH, BNB, SOL and XRP..."):
+        cutoff=pd.Timestamp.now(tz="UTC")-pd.Timedelta(days=30)
         for name,ticker in COINS.items():
             try:
-                # Fetch enough history for EMA(200) warm-up, then backtest only
-                # the most recent 30 calendar days. The old version cut to 30 days
-                # BEFORE calculating EMA(200), which could leave too few candles.
-                fetch_period = "60d" if interval_choice != "1d" else "2y"
-                raw=download_data(ticker,interval_choice,fetch_period)
+                raw=fetch(ticker,interval,"90d" if interval!="1d" else "2y")
                 if raw is None: continue
-
-                cutoff=pd.Timestamp.now(tz="UTC")-pd.Timedelta(days=30)
-
-                # Calculate indicators on the full warm-up history first.
-                full_ind=indicators(raw)
-                raw30=full_ind[full_ind.index>=cutoff].copy()
-                if len(raw30)<1: continue
-
-                # run_backtest expects indicator columns, so use a small wrapper
-                # that executes the same trade engine directly on prepared data.
-                d=raw30
-                capital=float(total_initial)
-                position=None
-                entry_price=0.0
-                trades=[]
-                equity=[]
-
-                for ts,row in d.iterrows():
-                    high=float(row.High); low=float(row.Low); close=float(row.Close)
-
-                    if position is None:
-                        if bool(row.LONG_SIGNAL):
-                            position="LONG"; entry_price=close
-                        elif bool(row.SHORT_SIGNAL):
-                            position="SHORT"; entry_price=close
-                    else:
-                        if position=="LONG":
-                            sl=entry_price*(1-sl_pct/100); tp=entry_price*(1+tp_pct/100)
-                            hit=None; exit_price=None
-                            if low<=sl: hit="SL"; exit_price=sl
-                            elif high>=tp: hit="TP"; exit_price=tp
-                            elif bool(row.SHORT_SIGNAL): hit="SIGNAL"; exit_price=close
-                            if hit:
-                                pnl=capital*((exit_price-entry_price)/entry_price)
-                                capital+=pnl
-                                trades.append([ts,"LONG",entry_price,exit_price,pnl,hit])
-                                position=None
-                        else:
-                            sl=entry_price*(1+sl_pct/100); tp=entry_price*(1-tp_pct/100)
-                            hit=None; exit_price=None
-                            if high>=sl: hit="SL"; exit_price=sl
-                            elif low<=tp: hit="TP"; exit_price=tp
-                            elif bool(row.LONG_SIGNAL): hit="SIGNAL"; exit_price=close
-                            if hit:
-                                pnl=capital*((entry_price-exit_price)/entry_price)
-                                capital+=pnl
-                                trades.append([ts,"SHORT",entry_price,exit_price,pnl,hit])
-                                position=None
-
-                    if position=="LONG":
-                        eq=capital*(1+(close-entry_price)/entry_price)
-                    elif position=="SHORT":
-                        eq=capital*(1+(entry_price-close)/entry_price)
-                    else:
-                        eq=capital
-                    equity.append((ts,eq))
-
-                if position is not None and len(d):
-                    last_ts=d.index[-1]; last_close=float(d.iloc[-1].Close)
-                    pnl=(capital*((last_close-entry_price)/entry_price)
-                         if position=="LONG"
-                         else capital*((entry_price-last_close)/entry_price))
-                    capital+=pnl
-                    trades.append([last_ts,position,entry_price,last_close,pnl,"END"])
-
-                tdf=pd.DataFrame(trades,columns=["Time","Side","Entry","Exit","PnL","Exit Reason"])
-                wins=int((tdf.PnL>0).sum()) if not tdf.empty else 0
-                losses=int((tdf.PnL<=0).sum()) if not tdf.empty else 0
-                ntr=len(tdf)
-                wr=(wins/ntr*100) if ntr else 0.0
-                res={"final":capital,"profit":capital-total_initial,"trades":ntr,
-                     "wins":wins,"losses":losses,"win_rate":wr,"max_dd":0.0,
-                     "trades_df":tdf,"equity_df":pd.DataFrame(equity,columns=["Time","Equity"])}
-
-
-                per_coin.append({
-                    "Coin":name,"Final Balance":res["final"],"P/L":res["profit"],
-                    "Trades":res["trades"],"Wins":res["wins"],"Losses":res["losses"],
-                    "Win Rate %":res["win_rate"],"Max DD %":res["max_dd"]
-                })
-                if not res["trades_df"].empty:
-                    t=res["trades_df"].copy(); t.insert(0,"Coin",name); all_trades.append(t)
+                d=raw[raw.index<=pd.Timestamp.now(tz="UTC")]
+                prep=indicators(d)
+                test=prep[prep.index>=cutoff]
+                if test.empty: continue
+                final,pnl,n,w,l,wr,dd,tr=backtest(d[ d.index>=cutoff ],10000.0)
+                rows.append({"Coin":name,"Final Balance":final,"P/L":pnl,"Trades":n,
+                             "Wins":w,"Losses":l,"Win Rate %":wr,"Max DD %":dd})
+                if not tr.empty:
+                    tr=tr.copy(); tr.insert(0,"Coin",name); all_trades.append(tr)
             except Exception as e:
-                st.warning(f"{name}: backtest error — {str(e)[:100]}")
-
-    if per_coin:
-        pdf=pd.DataFrame(per_coin)
-        # Combined result treats each coin as an independent ₹10,000 test,
-        # then reports the sum of P/L and aggregate win rate.
-        total_trades=int(pdf.Trades.sum()); total_wins=int(pdf.Wins.sum())
-        total_losses=int(pdf.Losses.sum())
-        combined_final=total_initial+float(pdf["P/L"].sum())
-        combined_profit=combined_final-total_initial
-        combined_wr=(total_wins/total_trades*100) if total_trades else 0.0
-
-        q1,q2,q3,q4,q5=st.columns(5)
-        q1.metric("Final Balance",f"₹{combined_final:,.2f}")
-        q2.metric("Total P/L",f"₹{combined_profit:,.2f}")
-        q3.metric("Win Rate",f"{combined_wr:.2f}%")
-        q4.metric("Total Trades",total_trades)
-        q5.metric("Wins / Losses",f"{total_wins} / {total_losses}")
-
-        st.dataframe(pdf.round({"Final Balance":2,"P/L":2,"Win Rate %":2,"Max DD %":2}),
-                     use_container_width=True,hide_index=True)
-
+                st.warning(f"{name}: {str(e)[:100]}")
+    if rows:
+        r=pd.DataFrame(rows)
+        total_trades=int(r.Trades.sum()); wins=int(r.Wins.sum()); losses=int(r.Losses.sum())
+        total_pnl=float(r["P/L"].sum())
+        # Each coin is an independent ₹10,000 simulation; this aggregate is clearly labeled.
+        st.info("Coin-wise simulations use ₹10,000 independently per coin; aggregate P/L below is the sum of those independent simulations.")
+        a,b,c,d,e=st.columns(5)
+        a.metric("Total P/L",f"₹{total_pnl:,.2f}")
+        b.metric("Aggregate Win Rate",f"{wins/total_trades*100:.2f}%" if total_trades else "0%")
+        c.metric("Trades",total_trades); d.metric("Wins",wins); e.metric("Losses",losses)
+        st.dataframe(r.round(2),use_container_width=True,hide_index=True)
         if all_trades:
             st.subheader("Trade History")
-            st.dataframe(pd.concat(all_trades,ignore_index=True).round(6),
-                         use_container_width=True,hide_index=True)
+            st.dataframe(pd.concat(all_trades,ignore_index=True).round(6),use_container_width=True,hide_index=True)
     else:
-        st.info("No sufficient 30-day data/trades were available.")
+        st.warning("No valid 30-day backtest data was available.")
 
 st.subheader("🔎 Detailed Chart")
 selected=st.selectbox("Select coin",names)
 if selected in results:
-    d=results[selected]["data"]; x=results[selected]["info"]
+    d=results[selected]["data"]
     fig=go.Figure()
     fig.add_trace(go.Candlestick(x=d.index,open=d.Open,high=d.High,low=d.Low,close=d.Close,name="Price"))
-    fig.add_trace(go.Scatter(x=d.index,y=d.EMA,mode="lines",name=f"EMA {ema_len}"))
+    fig.add_trace(go.Scatter(x=d.index,y=d.EMA200,mode="lines",name="EMA 200"))
     longs=d[d.LONG_SIGNAL]; shorts=d[d.SHORT_SIGNAL]
     if not longs.empty: fig.add_trace(go.Scatter(x=longs.index,y=longs.Low*.995,mode="markers",marker=dict(symbol="triangle-up",size=11),name="BUY"))
     if not shorts.empty: fig.add_trace(go.Scatter(x=shorts.index,y=shorts.High*1.005,mode="markers",marker=dict(symbol="triangle-down",size=11),name="SELL"))
     fig.update_layout(height=600,xaxis_rangeslider_visible=False,hovermode="x unified")
     st.plotly_chart(fig,use_container_width=True)
 
-st.caption("Educational scanner. Backtest results are historical simulation results and are not guaranteed future returns.")
+st.caption("Educational backtest. A 70% win rate or fixed profit is not guaranteed; validate on unseen data before using real money.")
