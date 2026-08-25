@@ -274,12 +274,87 @@ if st.button("▶️ Run Backtest",use_container_width=True):
     with st.spinner("Running 30-day backtest for BTC, ETH, BNB, SOL and XRP..."):
         for name,ticker in COINS.items():
             try:
-                raw=download_data(ticker,interval_choice,"60d" if interval_choice!="1d" else "2y")
+                # Fetch enough history for EMA(200) warm-up, then backtest only
+                # the most recent 30 calendar days. The old version cut to 30 days
+                # BEFORE calculating EMA(200), which could leave too few candles.
+                fetch_period = "60d" if interval_choice != "1d" else "2y"
+                raw=download_data(ticker,interval_choice,fetch_period)
                 if raw is None: continue
+
                 cutoff=pd.Timestamp.now(tz="UTC")-pd.Timedelta(days=30)
-                raw30=raw[raw.index>=cutoff].copy()
-                if len(raw30)<max(ema_len,rsi_len+rsi_sma_len)+5: continue
-                res=run_backtest(raw30,total_initial)
+
+                # Calculate indicators on the full warm-up history first.
+                full_ind=indicators(raw)
+                raw30=full_ind[full_ind.index>=cutoff].copy()
+                if len(raw30)<1: continue
+
+                # run_backtest expects indicator columns, so use a small wrapper
+                # that executes the same trade engine directly on prepared data.
+                d=raw30
+                capital=float(total_initial)
+                position=None
+                entry_price=0.0
+                trades=[]
+                equity=[]
+
+                for ts,row in d.iterrows():
+                    high=float(row.High); low=float(row.Low); close=float(row.Close)
+
+                    if position is None:
+                        if bool(row.LONG_SIGNAL):
+                            position="LONG"; entry_price=close
+                        elif bool(row.SHORT_SIGNAL):
+                            position="SHORT"; entry_price=close
+                    else:
+                        if position=="LONG":
+                            sl=entry_price*(1-sl_pct/100); tp=entry_price*(1+tp_pct/100)
+                            hit=None; exit_price=None
+                            if low<=sl: hit="SL"; exit_price=sl
+                            elif high>=tp: hit="TP"; exit_price=tp
+                            elif bool(row.SHORT_SIGNAL): hit="SIGNAL"; exit_price=close
+                            if hit:
+                                pnl=capital*((exit_price-entry_price)/entry_price)
+                                capital+=pnl
+                                trades.append([ts,"LONG",entry_price,exit_price,pnl,hit])
+                                position=None
+                        else:
+                            sl=entry_price*(1+sl_pct/100); tp=entry_price*(1-tp_pct/100)
+                            hit=None; exit_price=None
+                            if high>=sl: hit="SL"; exit_price=sl
+                            elif low<=tp: hit="TP"; exit_price=tp
+                            elif bool(row.LONG_SIGNAL): hit="SIGNAL"; exit_price=close
+                            if hit:
+                                pnl=capital*((entry_price-exit_price)/entry_price)
+                                capital+=pnl
+                                trades.append([ts,"SHORT",entry_price,exit_price,pnl,hit])
+                                position=None
+
+                    if position=="LONG":
+                        eq=capital*(1+(close-entry_price)/entry_price)
+                    elif position=="SHORT":
+                        eq=capital*(1+(entry_price-close)/entry_price)
+                    else:
+                        eq=capital
+                    equity.append((ts,eq))
+
+                if position is not None and len(d):
+                    last_ts=d.index[-1]; last_close=float(d.iloc[-1].Close)
+                    pnl=(capital*((last_close-entry_price)/entry_price)
+                         if position=="LONG"
+                         else capital*((entry_price-last_close)/entry_price))
+                    capital+=pnl
+                    trades.append([last_ts,position,entry_price,last_close,pnl,"END"])
+
+                tdf=pd.DataFrame(trades,columns=["Time","Side","Entry","Exit","PnL","Exit Reason"])
+                wins=int((tdf.PnL>0).sum()) if not tdf.empty else 0
+                losses=int((tdf.PnL<=0).sum()) if not tdf.empty else 0
+                ntr=len(tdf)
+                wr=(wins/ntr*100) if ntr else 0.0
+                res={"final":capital,"profit":capital-total_initial,"trades":ntr,
+                     "wins":wins,"losses":losses,"win_rate":wr,"max_dd":0.0,
+                     "trades_df":tdf,"equity_df":pd.DataFrame(equity,columns=["Time","Equity"])}
+
+
                 per_coin.append({
                     "Coin":name,"Final Balance":res["final"],"P/L":res["profit"],
                     "Trades":res["trades"],"Wins":res["wins"],"Losses":res["losses"],
