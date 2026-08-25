@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Conservative Pro Crypto Scanner V3",
+st.set_page_config(page_title="Conservative Pro Crypto Scanner V4",
                    page_icon="₿", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -28,7 +28,7 @@ div[data-testid="stMetric"]{background:#0f172a;border:1px solid rgba(148,163,184
 COINS={"Bitcoin":"BTC-USD","Ethereum":"ETH-USD","BNB":"BNB-USD",
        "Solana":"SOL-USD","XRP":"XRP-USD"}
 
-st.title("₿ Conservative Pro Crypto Scanner V3")
+st.title("₿ Conservative Pro Crypto Scanner V4")
 st.caption("EMA 200 • RSI 10/14 • Volume • ATR • Trend/Chop Filter • 2% SL • 4% TP")
 
 with st.sidebar:
@@ -45,6 +45,9 @@ with st.sidebar:
     volume_len=st.number_input("Volume SMA",5,50,20)
     atr_len=st.number_input("ATR",5,50,14)
     min_atr_pct=st.number_input("Minimum ATR %",0.05,10.0,0.20,0.05)
+    min_trend_gap=st.number_input("Minimum EMA gap %",0.05,10.0,0.35,0.05)
+    min_volume_ratio=st.number_input("Minimum volume / SMA",0.50,2.00,1.00,0.05)
+    cooldown_bars=st.number_input("Signal cooldown (candles)",0,20,2,1)
     st.subheader("Risk")
     sl_pct=st.number_input("Stop Loss %",0.1,20.0,2.0,0.1)
     tp_pct=st.number_input("Take Profit %",0.1,50.0,4.0,0.1)
@@ -92,42 +95,68 @@ def indicators(df):
     d["EMA_SLOPE"]=d.EMA200-d.EMA200.shift(5)
     d["BullCross"]=(d.RSI>d.RSI_SMA)&(d.RSI.shift(1)<=d.RSI_SMA.shift(1))
     d["BearCross"]=(d.RSI<d.RSI_SMA)&(d.RSI.shift(1)>=d.RSI_SMA.shift(1))
-    d["VOL_OK"]=d.Volume>=d.VOL_SMA*0.90
-    d["VOL_STRONG"]=d.Volume>=d.VOL_SMA*1.20
-    # Stronger entries: trend + momentum + candle + volatility + volume.
-    d["LONG_SIGNAL"]=(
-        d.BullCross & (d.Close>d.EMA200) & (d.EMA_SLOPE>0) &
-        (d.RSI>=52) & (d.RSI<=68) & d.VOL_OK & (d.ATR_PCT>=min_atr_pct) &
-        (d.Close>d.Open)
-    )
-    d["SHORT_SIGNAL"]=(
-        d.BearCross & (d.Close<d.EMA200) & (d.EMA_SLOPE<0) &
-        (d.RSI<=48) & (d.RSI>=32) & d.VOL_OK & (d.ATR_PCT>=min_atr_pct) &
-        (d.Close<d.Open)
-    )
+    d["EMA_GAP_PCT"]=(d.Close-d.EMA200).abs()/d.EMA200*100
+    d["VOL_RATIO"]=d.Volume/d.VOL_SMA.replace(0,np.nan)
+    d["VOL_OK"]=d.VOL_RATIO>=min_volume_ratio
+
+    # V4: require trend separation, not merely price being a few ticks above/below EMA.
+    # This is designed to reject many choppy BTC/ETH setups observed in V3.
+    bullish_trend=(d.Close>d.EMA200)&(d.EMA_SLOPE>0)&(d.EMA_GAP_PCT>=min_trend_gap)
+    bearish_trend=(d.Close<d.EMA200)&(d.EMA_SLOPE<0)&(d.EMA_GAP_PCT>=min_trend_gap)
+
+    # Momentum zones are deliberately kept away from extreme RSI where entries can chase.
+    long_momentum=(d.RSI>=53)&(d.RSI<=67)&(d.RSI>d.RSI_SMA)
+    short_momentum=(d.RSI<=47)&(d.RSI>=33)&(d.RSI<d.RSI_SMA)
+
+    # Strong candle confirmation: close must be in the upper/lower half of its range.
+    rng=(d.High-d.Low).replace(0,np.nan)
+    close_pos=(d.Close-d.Low)/rng
+    bull_candle=(d.Close>d.Open)&(close_pos>=0.55)
+    bear_candle=(d.Close<d.Open)&(close_pos<=0.45)
+
+    volatility=d.ATR_PCT>=min_atr_pct
+
+    d["LONG_SETUP"]=d.BullCross&bullish_trend&long_momentum&d.VOL_OK&volatility&bull_candle
+    d["SHORT_SETUP"]=d.BearCross&bearish_trend&short_momentum&d.VOL_OK&volatility&bear_candle
+
+    # Only accept the first confirmed setup after a cooldown.
+    d["LONG_SIGNAL"]=False
+    d["SHORT_SIGNAL"]=False
+    last_sig=-10**9
+    for i in range(len(d)):
+        if i-last_sig<=cooldown_bars:
+            continue
+        if bool(d["LONG_SETUP"].iloc[i]):
+            d.iloc[i,d.columns.get_loc("LONG_SIGNAL")]=True
+            last_sig=i
+        elif bool(d["SHORT_SETUP"].iloc[i]):
+            d.iloc[i,d.columns.get_loc("SHORT_SIGNAL")]=True
+            last_sig=i
     return d.dropna()
 
 def classify(d):
     r=d.iloc[-1]
-    long_score=sum([r.Close>r.EMA200,r.EMA_SLOPE>0,r.RSI>r.RSI_SMA,
-                    52<=r.RSI<=68,r.Volume>=r.VOL_SMA*.90,r.ATR_PCT>=min_atr_pct,r.Close>r.Open])
-    short_score=sum([r.Close<r.EMA200,r.EMA_SLOPE<0,r.RSI<r.RSI_SMA,
-                     32<=r.RSI<=48,r.Volume>=r.VOL_SMA*.90,r.ATR_PCT>=min_atr_pct,r.Close<r.Open])
+    long_score=sum([r.Close>r.EMA200,r.EMA_SLOPE>0,r.EMA_GAP_PCT>=min_trend_gap,
+                     53<=r.RSI<=67,r.RSI>r.RSI_SMA,r.VOL_RATIO>=min_volume_ratio,
+                     r.ATR_PCT>=min_atr_pct,r.Close>r.Open])
+    short_score=sum([r.Close<r.EMA200,r.EMA_SLOPE<0,r.EMA_GAP_PCT>=min_trend_gap,
+                      33<=r.RSI<=47,r.RSI<r.RSI_SMA,r.VOL_RATIO>=min_volume_ratio,
+                      r.ATR_PCT>=min_atr_pct,r.Close<r.Open])
     fresh="BUY" if bool(r.LONG_SIGNAL) else "SELL" if bool(r.SHORT_SIGNAL) else None
-    if fresh=="BUY" and long_score>=6:
+    if fresh=="BUY" and long_score>=7:
         signal="STRONG BUY"
-    elif fresh=="SELL" and short_score>=6:
+    elif fresh=="SELL" and short_score>=7:
         signal="STRONG SELL"
     elif fresh=="BUY": signal="BUY"
     elif fresh=="SELL": signal="SELL"
-    elif long_score>=5 and r.Close>r.EMA200 and r.RSI>r.RSI_SMA: signal="BUY"
-    elif short_score>=5 and r.Close<r.EMA200 and r.RSI<r.RSI_SMA: signal="SELL"
+    elif long_score>=7 and r.Close>r.EMA200 and r.RSI>r.RSI_SMA: signal="BUY"
+    elif short_score>=7 and r.Close<r.EMA200 and r.RSI<r.RSI_SMA: signal="SELL"
     else: signal="WAIT"
     entry=float(r.Close)
     if "BUY" in signal: sl=entry*(1-sl_pct/100); tp=entry*(1+tp_pct/100)
     elif "SELL" in signal: sl=entry*(1+sl_pct/100); tp=entry*(1-tp_pct/100)
     else: sl=tp=None
-    strength=max(long_score,short_score)/7*100
+    strength=max(long_score,short_score)/8*100
     cls="strongbuy" if signal=="STRONG BUY" else "buy" if signal=="BUY" else "strongsell" if signal=="STRONG SELL" else "sell" if signal=="SELL" else "wait"
     return {"signal":signal,"cls":cls,"price":entry,"ema":float(r.EMA200),"rsi":float(r.RSI),
             "rsi_sma":float(r.RSI_SMA),"atr":float(r.ATR_PCT),"strength":strength,
@@ -219,7 +248,7 @@ for start in range(0,len(names),2):
 
 st.divider()
 st.subheader("🧪 V3 Backtest")
-st.caption("30 days • ₹10,000 starting capital • same V3 filters • 2% SL • 4% TP")
+st.caption("30 days • ₹10,000 starting capital • V4 quality filters • 2% SL • 4% TP")
 
 if st.button("▶️ Run 30-Day V3 Backtest",use_container_width=True):
     rows=[]; all_trades=[]
@@ -233,7 +262,54 @@ if st.button("▶️ Run 30-Day V3 Backtest",use_container_width=True):
                 prep=indicators(d)
                 test=prep[prep.index>=cutoff]
                 if test.empty: continue
-                final,pnl,n,w,l,wr,dd,tr=backtest(d[ d.index>=cutoff ],10000.0)
+
+                # Backtest the prepared full-history dataframe, but only allow
+                # trades whose signal candle is inside the last 30 days.
+                bt=prep[prep.index>=cutoff].copy()
+                if bt.empty: continue
+
+                capital=10000.0; pos=None; entry=0.0; trades=[]; equity=[]
+                for ts,r in bt.iterrows():
+                    hi=float(r.High); lo=float(r.Low); close=float(r.Close)
+                    if pos is None:
+                        if bool(r.LONG_SIGNAL): pos="LONG"; entry=close
+                        elif bool(r.SHORT_SIGNAL): pos="SHORT"; entry=close
+                    elif pos=="LONG":
+                        sl=entry*(1-sl_pct/100); tp=entry*(1+tp_pct/100)
+                        if lo<=sl: exitp=sl; reason="SL"
+                        elif hi>=tp: exitp=tp; reason="TP"
+                        elif bool(r.SHORT_SIGNAL): exitp=close; reason="SIGNAL"
+                        else: exitp=None
+                        if exitp is not None:
+                            pnl=capital*(exitp-entry)/entry; capital+=pnl
+                            trades.append([ts,pos,entry,exitp,pnl,reason]); pos=None
+                    else:
+                        sl=entry*(1+sl_pct/100); tp=entry*(1-tp_pct/100)
+                        if hi>=sl: exitp=sl; reason="SL"
+                        elif lo<=tp: exitp=tp; reason="TP"
+                        elif bool(r.LONG_SIGNAL): exitp=close; reason="SIGNAL"
+                        else: exitp=None
+                        if exitp is not None:
+                            pnl=capital*(entry-exitp)/entry; capital+=pnl
+                            trades.append([ts,pos,entry,exitp,pnl,reason]); pos=None
+                    equity.append((ts,capital))
+
+                if pos is not None and len(bt):
+                    last_close=float(bt.iloc[-1].Close)
+                    pnl=capital*((last_close-entry)/entry if pos=="LONG" else (entry-last_close)/entry)
+                    capital+=pnl
+                    trades.append([bt.index[-1],pos,entry,last_close,pnl,"END"])
+
+                tr=pd.DataFrame(trades,columns=["Time","Side","Entry","Exit","PnL","Reason"])
+                n=len(tr); w=int((tr.PnL>0).sum()) if n else 0
+                l=int((tr.PnL<=0).sum()) if n else 0
+                wr=w/n*100 if n else 0
+                final=capital; pnl=capital-10000.0
+                eq=pd.Series([x[1] for x in equity])
+                dd=((eq-eq.cummax())/eq.cummax()*100).min() if len(eq) else 0
+                max_dd=float(dd)
+                if not tr.empty:
+                    pass
                 rows.append({"Coin":name,"Final Balance":final,"P/L":pnl,"Trades":n,
                              "Wins":w,"Losses":l,"Win Rate %":wr,"Max DD %":dd})
                 if not tr.empty:
