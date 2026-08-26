@@ -1,95 +1,144 @@
-# V5.2 Crypto Trading Signal Dashboard
+# V5.3 Pro Crypto Trading Signal Dashboard
 
-Streamlit + Python crypto research / paper-signal dashboard for BTC, ETH, BNB, SOL and XRP.
+A conservative Streamlit + Python **paper/research** dashboard for BTC, ETH, BNB, SOL and XRP.
 
-## The Streamlit Cloud / Binance 451 problem is handled
+## What was fixed from V5.2
 
-This version **does not use Binance**.
+The previous versions had two important problems:
 
-Some Streamlit Cloud deployments can receive Binance HTTP `451 Service unavailable from a restricted location` responses. To prevent that single-provider failure from taking down the dashboard, V5 uses a public-data fallback chain:
+1. Binance HTTP 451 / restricted-location errors on Streamlit Cloud.
+2. The backtest could make unrealistic decisions around the same candle used for a signal.
 
-1. OKX
-2. KuCoin
-3. Kraken
-4. Coinbase
+V5.3 removes Binance completely and uses:
 
-If one provider fails, the next provider is tried automatically. If all providers fail, only the affected card/backtest is reported as unavailable; the entire app does not crash.
+**OKX → KuCoin → Kraken → Coinbase**
 
-No API keys are required.
+The backtest now follows a strict sequence:
 
-## Timeframes
+**closed candle signal → next candle OPEN entry → future candle management**
 
-- 1H
-- 2H
-- 4H
-- 1D
+It does not enter at a candle close and then use that same candle's high/low to manufacture a result.
 
-2H is constructed from closed 1H candles, so the dashboard does not depend on an exchange offering a native 2H timeframe.
+## Risk / reward design
 
-## Signal engine
+The objective is not to force a 70% win rate. The engine is designed around controlled risk:
 
+- Starting capital: ₹10,000
+- Risk per trade: 1% of current equity
+- Initial hard stop: 2%
+- Base take profit: 4%
+- Minimum intended reward/risk: 2:1
+- Trailing activates only after approximately +2%
+- Break-even protection is added when trailing activates
+- ATR-based trailing distance
+- Early exit only after a confirmed momentum/trend deterioration
+- 0.05% estimated fee per side in backtest
+- Compounding: position risk is based on current equity
+
+This does **not** guarantee profit. A strategy can still lose money.
+
+## Signal model
+
+Signals use closed candles and combine:
+
+- EMA20
+- EMA50
 - EMA200
 - RSI(14)
 - RSI SMA(14)
-- Volume vs 20-period average
 - ATR(14)
-- Candle confirmation
-- Strong Buy / Buy / Wait / Sell / Strong Sell
-- Extra quality filters for BTC and ETH
-- Closed-candle analysis
+- Volume vs 20-period average
+- Candle-body / close-position confirmation
+- Volatility sanity filter
+- Extra quality restrictions for BTC and ETH
+
+Labels:
+
+- Strong Buy
+- Buy
+- Wait
+- Sell
+- Strong Sell
 
 ## Trade lifecycle
 
 `WAIT → ENTER LONG/SHORT → HOLD → EXIT NOW`
 
-Each active trade tracks:
+The persistent ledger stores:
 
 - Entry
 - Current price
-- Initial 2% SL
-- Base 4% TP
-- ATR-based trailing stop
+- Initial SL
+- Base TP
+- Trailing stop
+- Risk amount
 - Current P/L
 - Signal strength
+- Signal label
 - Exit reason
 
-Early exit can happen when momentum weakens or the trend reverses.
-
-Active paper trades are persisted in SQLite so Streamlit reruns/refreshes do not erase them.
+SQLite keeps active paper trades across Streamlit reruns.
 
 ## Backtest
 
-- ₹10,000 starting capital
+The Backtest button runs:
+
+- Previous 30 days: In-Sample
+- Most recent 30 days: Out-of-Sample
+- EMA200 warm-up before both windows
 - Compounding
-- 30-day in-sample
-- Recent 30-day out-of-sample
 - Win rate
 - Total P/L
-- Average win/loss
+- Average win
+- Average loss
 - Profit factor
-- Max drawdown
-- TP / SL / trailing / early exits
-- Trade history
+- Maximum drawdown
+- TP exits
+- SL exits
+- Trailing exits
+- Early exits
+- End-of-test exits
+- Full OOS trade history CSV download
 
-The backtest fetches substantially more than 200 candles before the evaluation window. EMA200 is therefore **not** initialized from only the 30-day test period.
+### Look-ahead protection
 
-## No fake performance
+The signal is calculated only from a completed candle. The trade enters at the next candle's open. If the next candle touches both SL and TP, the backtest assumes **SL first** (conservative ambiguity handling).
 
-This project does not promise:
+Trailing stops are updated only after a candle closes, so a newly created trailing stop cannot retroactively exit the same candle.
 
-- 70% win rate
-- ₹7,000 profit
-- guaranteed returns
+## Historical data
 
-Results are actual results from the retrieved historical data and the coded rules.
+The engine fetches substantially more than 200 candles before the evaluation windows. EMA200 is calculated on that warm-up history and only then is the 30-day test window evaluated.
 
-## Run locally
+2H is constructed from closed 1H candles, so a provider does not need a native 2H market timeframe.
+
+## INR conversion
+
+Exchange OHLCV is quoted in USDT/USD. The sidebar contains an editable **USDT → INR assumption** (default 88.0) so the ₹10,000 account and P/L calculations have consistent units.
+
+Change it if you want to use a different conversion assumption. It is not a live FX feed.
+
+## Streamlit Cloud
+
+No exchange API keys are required because the dashboard uses public OHLCV endpoints.
+
+Upload these files to GitHub:
+
+- `app.py`
+- `requirements.txt`
+- `.streamlit/config.toml`
+- `README.md`
+- `LICENSE`
+
+Then deploy `app.py` on Streamlit Cloud.
+
+## Local run
 
 ```bash
 python -m venv .venv
 
 # Windows
-.venv\Scripts\activate
+.venv\\Scripts\\activate
 
 # macOS/Linux
 # source .venv/bin/activate
@@ -98,33 +147,15 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Streamlit Cloud
+## Data-provider failure behavior
 
-Upload:
+If OKX fails, the app tries KuCoin. If KuCoin fails, it tries Kraken, then Coinbase. If all fail, only that card/backtest reports the failure; the entire app does not crash.
 
-- `app.py`
-- `requirements.txt`
-- `.streamlit/config.toml`
-- `README.md`
+## Important limitations
 
-Then deploy `app.py`.
-
-No exchange credentials are needed for public OHLCV.
-
-### Persistence note
-
-SQLite is suitable for local use. Streamlit Cloud containers can be recycled, so production-grade persistent trade state should use hosted PostgreSQL or another persistent database.
-
-## Paper trading only
-
-The dashboard does not place real orders. ENTER/HOLD/EXIT is a paper-trading state machine.
-
-Past performance does not guarantee future results.
-
-
-## V5.2 bug fix
-
-V5.1's provider failover was correct, but a packaging regression omitted the
-indicator helper functions used by the signal/backtest engine. V5.2 restores
-the EMA/RSI/ATR/enrichment layer and adds warm-up validation before signals
-are evaluated.
+- This is a rule-based research/paper system.
+- No real orders are placed.
+- No win-rate or profit is guaranteed.
+- A 30-day OOS sample can be statistically small.
+- Public exchange data can differ slightly between providers.
+- SQLite on Streamlit Cloud is not guaranteed to survive container replacement. Use a persistent database for production-grade state.
