@@ -223,6 +223,53 @@ def fetch_ohlcv(symbol, timeframe, limit=1800):
 # -----------------------------
 # Signal engine
 # -----------------------------
+def ema(s, n):
+    return s.ewm(span=n, adjust=False, min_periods=1).mean()
+
+def rsi(s, n=14):
+    delta = s.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    avg_loss = loss.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+
+    # Handle a permanently rising/flat series safely.
+    out = out.where(avg_loss.notna(), 50)
+    out = out.fillna(50)
+    return out.clip(0, 100)
+
+def atr(df, n=14):
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    return tr.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+
+def enrich(df):
+    x = df.copy()
+
+    # EMA200 is calculated over the full warm-up history supplied by the
+    # data layer, not just the 30-day evaluation window.
+    x["ema200"] = ema(x["close"], 200)
+    x["ema20"] = ema(x["close"], 20)
+    x["ema50"] = ema(x["close"], 50)
+
+    x["rsi"] = rsi(x["close"], 14)
+    x["rsi_sma"] = x["rsi"].rolling(14, min_periods=14).mean()
+    x["atr"] = atr(x, 14)
+
+    x["vol_sma"] = x["volume"].rolling(20, min_periods=20).mean()
+    x["atr_pct"] = (x["atr"] / x["close"].replace(0, np.nan)) * 100
+
+    return x
+
 def candle_confirmation(x):
     o, h, l, c = x[["open","high","low","close"]]
     body = abs(c-o)
@@ -233,8 +280,12 @@ def candle_confirmation(x):
     return bull, bear
 
 def signal_for(df, symbol):
-    x = enrich(df).iloc[-1]
-    prev = enrich(df).iloc[-2]
+    enriched = enrich(df).dropna(subset=[
+        "ema200", "rsi", "rsi_sma", "atr", "vol_sma", "ema20", "ema50"
+    ])
+    if len(enriched) < 2:
+        raise RuntimeError("Not enough warmed-up candles for signal calculation")
+    x = enriched.iloc[-1]
     bull_c, bear_c = candle_confirmation(x)
 
     long_score = 0.0
@@ -411,6 +462,8 @@ def backtest(df, symbol, initial=START_CAPITAL):
 
     for i in range(1, len(x)):
         window = x.iloc[:i+1]
+        if len(window) < 220:
+            continue
         sig = signal_for(window, symbol)
         price = float(x.iloc[i].close)
 
@@ -581,6 +634,8 @@ for col, symbol in zip(cols, COINS):
                 "The app tried OKX → KuCoin → Kraken → Coinbase. "
                 "Retrying automatically on the next refresh."
             )
+            with st.expander("Technical details"):
+                st.code(str(e))
 
 st.divider()
 st.header("📊 Backtest")
