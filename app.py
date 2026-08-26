@@ -22,12 +22,33 @@ DB_FILE = "v5_trades.db"
 # -----------------------------
 # Exchange / persistence
 # -----------------------------
+# IMPORTANT:
+# Binance is intentionally NOT used. Streamlit Cloud deployments can receive
+# Binance HTTP 451 errors because the cloud runtime may be in a restricted
+# jurisdiction. We therefore use a provider chain and automatically fail over.
+#
+# Provider order:
+#   OKX -> KuCoin -> Kraken -> Coinbase
+#
+# No API keys are required because only public OHLCV endpoints are used.
+
+PROVIDERS = ["okx", "kucoin", "kraken", "coinbase"]
+
 @st.cache_resource
-def get_exchange():
-    return ccxt.binance({
+def get_exchange(name):
+    cfg = {
         "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
+        "timeout": 15000,
+    }
+    if name == "okx":
+        return ccxt.okx(cfg)
+    if name == "kucoin":
+        return ccxt.kucoin(cfg)
+    if name == "kraken":
+        return ccxt.kraken(cfg)
+    if name == "coinbase":
+        return ccxt.coinbase(cfg)
+    raise ValueError(f"Unsupported provider: {name}")
 
 def db():
     con = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -87,54 +108,117 @@ def delete_trade(symbol):
     con.commit()
     con.close()
 
-# -----------------------------
-# Market data
-# -----------------------------
+def _native_symbol(exchange, symbol):
+    """Return a symbol only if the provider actually lists it."""
+    try:
+        markets = exchange.load_markets()
+        if symbol in markets:
+            return symbol
+        # Some providers list XRP/USD rather than XRP/USDT.
+        base, quote = symbol.split("/")
+        alternatives = [
+            f"{base}/USDT",
+            f"{base}/USD",
+            f"{base}/USDC",
+        ]
+        for alt in alternatives:
+            if alt in markets:
+                return alt
+    except Exception:
+        pass
+    return None
+
+def _fetch_paginated(exchange, symbol, timeframe, target=1800):
+    """
+    Fetch enough candles for both EMA200 warm-up and a full 60-day test.
+    Repeated requests avoid the common exchange limit of ~500-1000 candles.
+    """
+    actual = _native_symbol(exchange, symbol)
+    if not actual:
+        raise RuntimeError(f"{symbol} is not listed by this provider")
+
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+    now_ms = exchange.milliseconds()
+    since = now_ms - tf_ms * (target + 5)
+    rows = []
+    seen = set()
+
+    for _ in range(5):
+        batch = exchange.fetch_ohlcv(
+            actual, timeframe=timeframe, since=since, limit=min(1000, target)
+        )
+        if not batch:
+            break
+        for r in batch:
+            if r[0] not in seen:
+                seen.add(r[0])
+                rows.append(r)
+        if len(batch) < min(1000, target):
+            break
+        since = batch[-1][0] + tf_ms
+        if len(rows) >= target:
+            break
+
+    if not rows:
+        raise RuntimeError(f"No OHLCV returned for {symbol}")
+
+    rows = sorted(rows, key=lambda r: r[0])[-target:]
+    return rows
+
+def _resample_2h_from_1h(df):
+    """Build 2H candles from closed 1H candles."""
+    x = df.copy().set_index("timestamp")
+    out = x.resample("2h", label="right", closed="right").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna().reset_index()
+    return out
+
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_ohlcv(symbol, timeframe, limit=700):
-    ex = get_exchange()
-    data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    if not data:
-        raise RuntimeError(f"No OHLCV returned for {symbol} {timeframe}")
-    df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    # Never use the currently forming candle.
-    if len(df) > 2:
-        df = df.iloc[:-1].copy()
-    return df.reset_index(drop=True)
+def fetch_ohlcv(symbol, timeframe, limit=1800):
+    errors = []
 
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
+    # 2H is constructed from 1H so it does not depend on an exchange
+    # supporting a native 2H market timeframe.
+    source_tf = "1h" if timeframe == "2h" else timeframe
+    source_limit = max(limit * 2 + 20, 1000) if timeframe == "2h" else max(limit, 1000)
 
-def rsi(s, n=14):
-    d = s.diff()
-    up = d.clip(lower=0)
-    down = -d.clip(upper=0)
-    avg_up = up.ewm(alpha=1/n, adjust=False).mean()
-    avg_down = down.ewm(alpha=1/n, adjust=False).mean()
-    rs = avg_up / avg_down.replace(0, np.nan)
-    return (100 - 100/(1+rs)).fillna(50)
+    for provider in PROVIDERS:
+        try:
+            ex = get_exchange(provider)
+            rows = _fetch_paginated(ex, symbol, source_tf, target=source_limit)
+            df = pd.DataFrame(
+                rows,
+                columns=["timestamp","open","high","low","close","volume"]
+            )
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.drop_duplicates("timestamp").sort_values("timestamp")
 
-def atr(df, n=14):
-    prev = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"]-df["low"],
-        (df["high"]-prev).abs(),
-        (df["low"]-prev).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean()
+            # Remove the currently forming candle.
+            if len(df) > 2:
+                tf_delta = pd.Timedelta(hours=1 if source_tf == "1h" else
+                                        4 if source_tf == "4h" else
+                                        24 if source_tf == "1d" else 1)
+                cutoff = pd.Timestamp.now(tz="UTC") - tf_delta
+                df = df[df["timestamp"] <= cutoff].copy()
 
-def enrich(df):
-    x = df.copy()
-    x["ema200"] = ema(x["close"], 200)
-    x["rsi"] = rsi(x["close"], 14)
-    x["rsi_sma"] = x["rsi"].rolling(14).mean()
-    x["atr"] = atr(x, 14)
-    x["vol_sma"] = x["volume"].rolling(20).mean()
-    x["ema20"] = ema(x["close"], 20)
-    x["ema50"] = ema(x["close"], 50)
-    x["atr_pct"] = x["atr"] / x["close"] * 100
-    return x
+            if timeframe == "2h":
+                df = _resample_2h_from_1h(df)
+
+            df = df.tail(limit).reset_index(drop=True)
+            if len(df) < 250:
+                raise RuntimeError(f"Only {len(df)} usable candles")
+
+            return df
+
+        except Exception as e:
+            errors.append(f"{provider}: {type(e).__name__}: {str(e)[:100]}")
+            continue
+
+    raise RuntimeError("All market-data providers failed. " + " | ".join(errors))
 
 # -----------------------------
 # Signal engine
@@ -390,9 +474,9 @@ def backtest(df, symbol, initial=START_CAPITAL):
     return pd.DataFrame(trades), capital, max_dd
 
 def prepare_backtest_data(symbol, timeframe):
-    # 700 candles supplies substantial warm-up for EMA200. For 1D this is
-    # intentionally much more than the 60-day evaluation window.
-    return fetch_ohlcv(symbol, timeframe, limit=700)
+    # Fetch enough history for EMA200 warm-up PLUS the full 60-day evaluation.
+    # For 1H/2H this is intentionally > 60 days; for 4H/1D it is also ample.
+    return fetch_ohlcv(symbol, timeframe, limit=1800)
 
 def run_periodic_backtest(symbol, timeframe):
     df = prepare_backtest_data(symbol, timeframe)
@@ -492,8 +576,11 @@ for col, symbol in zip(cols, COINS):
             else:
                 st.info("WAIT")
         except Exception as e:
-            st.warning(f"Data unavailable: {type(e).__name__}")
-            st.caption("The app continues running; retry on next refresh.")
+            st.warning("Market data temporarily unavailable")
+            st.caption(
+                "The app tried OKX → KuCoin → Kraken → Coinbase. "
+                "Retrying automatically on the next refresh."
+            )
 
 st.divider()
 st.header("📊 Backtest")
